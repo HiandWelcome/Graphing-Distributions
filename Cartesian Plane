@@ -1,0 +1,331 @@
+# chatGPT generated codes and visuals. 
+# Very helpful in learning about distributions. 
+
+# Cartesian plane
+# Run the Core helper first, then run the example:
+# Once the Core helper is ran, I can change distribution and observe its movement.  
+
+library(ggplot2)
+
+#The following Helper is for incorporating Pareto distribution as well. 
+install.packages("VGAM")
+install.packages("actuar")
+library(VGAM)
+library(actuar)
+
+shade_area <- function(side = c("between", "left", "right", "two_tailed", "central"),
+                       a = NA, b = NA,
+                       prob = 0.05,
+                       central_prob = 0.95,
+                       dfun, pfun, args = list(),
+                       xrange = NULL, title = "", ...,
+                       approx = c("native","normal"),
+                       continuity = FALSE) {
+  
+  stopifnot(requireNamespace("ggplot2", quietly = TRUE))
+  side    <- match.arg(side)
+  approx  <- match.arg(approx)
+  extras  <- list(...)
+  
+  # ---------- utilities ----------
+  is_specified <- function(z) isTRUE(is.finite(z))
+  nm_strip     <- function(z) sub(".*::", "", z)
+  
+  dfun_name     <- nm_strip(deparse(substitute(dfun)))
+  pfun_name     <- nm_strip(deparse(substitute(pfun)))
+  expected_pfun <- sub("^d", "p", dfun_name)
+  if (!identical(pfun_name, expected_pfun)) {
+    warning(sprintf("dfun/pfun may be from different families: dfun='%s', pfun='%s' (expected '%s').",
+                    dfun_name, pfun_name, expected_pfun))
+  }
+  
+  # classify by name (before any approximation)
+  is_discrete0 <- grepl("^(dbinom|dpois|dgeom|dhyper|dnbinom)\\b", dfun_name, ignore.case = TRUE)
+  
+  # wrappers with args (may get replaced if we switch to normal approx)
+  dens <- function(x) do.call(dfun, c(list(x), args))
+  cdf  <- function(x) do.call(pfun, c(list(x), args))
+  
+  # robust q* resolver preferring dfun's namespace
+  get_qfun <- function(dfun_obj, dfun_name) {
+    qname <- sub("^d", "q", nm_strip(dfun_name))
+    env <- environment(dfun_obj)
+    ns_name <- tryCatch(getNamespaceName(env), error = function(e) NULL)
+    if (is.character(ns_name) && nzchar(ns_name)) {
+      if (qname %in% getNamespaceExports(ns_name)) return(getFromNamespace(qname, ns_name))
+      if (exists(qname, envir = asNamespace(ns_name), mode = "function", inherits = FALSE)) {
+        return(getFromNamespace(qname, ns_name))
+      }
+    }
+    if (exists(qname, mode = "function")) return(get(qname))
+    NULL
+  }
+  qfun0 <- get_qfun(dfun, dfun_name)
+  qfun  <- if (!is.null(qfun0)) function(p) do.call(qfun0, c(list(p), args)) else NULL
+  
+  # ---------- optional: switch discrete to normal approx ----------
+  switched_to_normal <- FALSE
+  if (approx == "normal" && is_discrete0) {
+    mu <- sd <- NA_real_
+    
+    if (grepl("^dbinom\\b", dfun_name, ignore.case = TRUE) && !is.null(args$size) && !is.null(args$prob)) {
+      n <- args$size; p <- args$prob
+      mu <- n * p
+      sd <- sqrt(n * p * (1 - p))
+    } else if (grepl("^dpois\\b", dfun_name, ignore.case = TRUE) && !is.null(args$lambda)) {
+      lambda <- args$lambda
+      mu <- lambda; sd <- sqrt(lambda)
+    } else if (grepl("^dgeom\\b", dfun_name, ignore.case = TRUE) && !is.null(args$prob)) {
+      # base R geometric counts failures: mean=(1-p)/p, var=(1-p)/p^2
+      p <- args$prob
+      mu <- (1 - p) / p
+      sd <- sqrt(1 - p) / p
+    } else if (grepl("^dnbinom\\b", dfun_name, ignore.case = TRUE) && !is.null(args$size) && (!is.null(args$prob) || !is.null(args$mu))) {
+      r <- args$size
+      if (!is.null(args$prob)) {
+        p <- args$prob
+        mu <- r * (1 - p) / p
+        sd <- sqrt(r * (1 - p)) / p
+      } else {
+        mu_param <- args$mu
+        mu <- mu_param
+        sd <- sqrt(mu_param + (mu_param^2)/r)
+      }
+    } else if (grepl("^dhyper\\b", dfun_name, ignore.case = TRUE) && !is.null(args$m) && !is.null(args$n) && !is.null(args$k)) {
+      m <- args$m; n <- args$n; k <- args$k
+      N <- m + n
+      mu <- k * (m / N)
+      sd <- sqrt(k * (m/N) * (1 - m/N) * ((N - k) / (N - 1)))
+    }
+    
+    if (is.finite(mu) && is.finite(sd) && sd > 0) {
+      # continuity correction on cutoffs, if requested
+      if (continuity) {
+        if (side %in% c("left","right","between")) {
+          # Inclusive probabilities:
+          if (side %in% c("left")      && is_specified(a)) a <- a + 0.5  # P(X ≤ a) → integrate to a+0.5
+          if (side %in% c("right")     && is_specified(b)) b <- b - 0.5  # P(X ≥ b) → start at b-0.5
+          if (side %in% c("between")) {
+            if (is_specified(a)) a <- a - 0.5                           # widen left bound
+            if (is_specified(b)) b <- b + 0.5                           # widen right bound
+          }
+        }
+        # 'two_tailed' and 'central' use q* cutoffs on a continuous scale; skip extra correction
+      }
+      # swap to normal
+      dfun <- stats::dnorm
+      pfun <- stats::pnorm
+      args <- list(mean = mu, sd = sd)
+      qfun <- function(p) stats::qnorm(p, mean = mu, sd = sd)
+      switched_to_normal <- TRUE
+    }
+  }
+  
+  # after possible swap, recompute discreteness for plotting style
+  is_discrete <- if (switched_to_normal) FALSE else is_discrete0
+  
+  # ---------- xrange ----------
+  if (is.null(xrange)) {
+    if (!is.null(qfun)) {
+      xrange <- c(qfun(0.001), qfun(0.999))
+      if (!all(is.finite(xrange))) xrange <- c(-100, 100)
+    } else {
+      pos_support <- grepl("(gamma|chisq|pareto|lomax|exp)\\b", dfun_name, ignore.case = TRUE)
+      xrange <- if (pos_support) c(0, 100) else c(-100, 100)
+    }
+  } else {
+    stopifnot(is.numeric(xrange), length(xrange) == 2)
+  }
+  xrange <- sort(xrange)
+  
+  # ---------- grid + base plot ----------
+  if (is_discrete) {
+    x <- seq(ceiling(xrange[1]), floor(xrange[2]), by = 1L)
+    y <- dens(x)
+    dat <- data.frame(x = as.integer(x), y = y)
+    base <- ggplot2::geom_col(width = 0.9, na.rm = TRUE)
+  } else {
+    x <- seq(xrange[1], xrange[2], length.out = 2000)
+    y <- dens(x)
+    dat <- data.frame(x = x, y = y)
+    base <- ggplot2::geom_line(na.rm = TRUE)
+  }
+  
+  g <- ggplot2::ggplot(dat, ggplot2::aes(x, y)) + base
+  
+  lab  <- ""
+  area <- NA_real_
+  lower <- upper <- NA_real_
+  
+  # ---------- shading ----------
+  if (side == "between") {
+    stopifnot(is_specified(a), is_specified(b), a < b)
+    if (is_discrete) {
+      mask <- dat$x >= ceiling(a) & dat$x <= floor(b)
+      area <- sum(dat$y[mask])
+    } else {
+      mask <- dat$x >= a & dat$x <= b
+      area <- cdf(b) - cdf(a)
+    }
+    lab <- sprintf("P(%g \u2264 X \u2264 %g) = %.4f", a, b, area)
+    if (is_discrete) {
+      g <- g + ggplot2::geom_col(data = dat[mask, ], ggplot2::aes(x, y), alpha = 0.3)
+    } else {
+      g <- g +
+        ggplot2::geom_ribbon(data = dat[mask, ], ggplot2::aes(ymin = 0, ymax = y),
+                             alpha = 0.3, na.rm = TRUE) +
+        ggplot2::geom_vline(xintercept = c(a, b), linetype = "dashed")
+    }
+    
+  } else if (side == "left") {
+    if (!is_specified(a)) {
+      stopifnot(!is.null(qfun), prob > 0, prob < 1)
+      a <- qfun(prob)
+    }
+    if (is_discrete) {
+      mask <- dat$x <= floor(a)
+      area <- sum(dat$y[mask])
+    } else {
+      mask <- dat$x <= a
+      area <- cdf(a)
+    }
+    lab <- sprintf("P(X \u2264 %g) = %.4f  (\u03B1_left = %.3f)", a, area, area)
+    if (is_discrete) {
+      g <- g + ggplot2::geom_col(data = dat[mask, ], ggplot2::aes(x, y), alpha = 0.3)
+    } else {
+      g <- g +
+        ggplot2::geom_ribbon(data = dat[mask, ], ggplot2::aes(ymin = 0, ymax = y),
+                             alpha = 0.3, na.rm = TRUE) +
+        ggplot2::geom_vline(xintercept = a, linetype = "dashed")
+    }
+    
+  } else if (side == "right") {
+    if (!is_specified(b)) {
+      stopifnot(!is.null(qfun), prob > 0, prob < 1)
+      b <- qfun(1 - prob)
+    }
+    if (is_discrete) {
+      mask <- dat$x >= ceiling(b)
+      area <- sum(dat$y[mask])
+    } else {
+      mask <- dat$x >= b
+      area <- 1 - cdf(b)
+    }
+    lab <- sprintf("P(X \u2265 %g) = %.4f  (\u03B1_right = %.3f)", b, area, area)
+    if (is_discrete) {
+      g <- g + ggplot2::geom_col(data = dat[mask, ], ggplot2::aes(x, y), alpha = 0.3)
+    } else {
+      g <- g +
+        ggplot2::geom_ribbon(data = dat[mask, ], ggplot2::aes(ymin = 0, ymax = y),
+                             alpha = 0.3, na.rm = TRUE) +
+        ggplot2::geom_vline(xintercept = b, linetype = "dashed")
+    }
+    
+  } else if (side == "two_tailed") {
+    if (is_specified(a) || is_specified(b)) {
+      warning("`two_tailed` ignores `a`/`b`; use `between` for fixed cutoffs, or set `prob = alpha_total`.")
+    }
+    stopifnot(!is.null(qfun), prob > 0, prob < 1)
+    lower <- qfun(prob/2); upper <- qfun(1 - prob/2)
+    if (is_discrete) {
+      mask <- dat$x <= floor(lower) | dat$x >= ceiling(upper)
+      area <- sum(dat$y[dat$x <= floor(lower)]) + sum(dat$y[dat$x >= ceiling(upper)])
+      lab  <- sprintf("Two-tailed \u03B1 = %.3f (cutoffs: [%.4g, %.4g]; mass \u2248 %.4f)", prob, lower, upper, area)
+      g <- g + ggplot2::geom_col(data = dat[mask, ], ggplot2::aes(x, y), alpha = 0.3)
+    } else {
+      dat_left  <- subset(dat, x <= lower); dat_left$grp  <- "left"
+      dat_right <- subset(dat, x >= upper); dat_right$grp <- "right"
+      dat_tails <- rbind(dat_left, dat_right)
+      g <- g +
+        ggplot2::geom_ribbon(data = dat_tails, ggplot2::aes(ymin = 0, ymax = y, group = grp),
+                             alpha = 0.3, na.rm = TRUE) +
+        ggplot2::geom_vline(xintercept = c(lower, upper), linetype = "dashed")
+      area <- prob
+      lab  <- sprintf("Two-tailed \u03B1 = %.3f  (cutoffs: [%.4g, %.4g])", prob, lower, upper)
+    }
+    
+  } else if (side == "central") {
+    if (is_specified(a) || is_specified(b)) {
+      warning("`central` ignores `a`/`b`; supply `central_prob` or use `between` for fixed cutoffs.")
+    }
+    stopifnot(!is.null(qfun), central_prob > 0, central_prob < 1)
+    alpha <- 1 - central_prob
+    lower <- qfun(alpha/2); upper <- qfun(1 - alpha/2)
+    if (is_discrete) {
+      mask <- dat$x >= ceiling(lower) & dat$x <= floor(upper)
+      area <- sum(dat$y[mask])
+    } else {
+      mask <- dat$x >= lower & dat$x <= upper
+      area <- central_prob
+    }
+    lab <- sprintf("Central mass %.3f  (cutoffs: [%.4g, %.4g])", central_prob, lower, upper)
+    if (is_discrete) {
+      g <- g + ggplot2::geom_col(data = dat[mask, ], ggplot2::aes(x, y), alpha = 0.3)
+    } else {
+      g <- g +
+        ggplot2::geom_ribbon(data = dat[mask, ], ggplot2::aes(ymin = 0, ymax = y),
+                             alpha = 0.3, na.rm = TRUE) +
+        ggplot2::geom_vline(xintercept = c(lower, upper), linetype = "dashed")
+    }
+  }
+  
+  if (length(extras)) for (e in extras) g <- g + e
+  
+  y_lab <- if (is_discrete) "PMF" else "PDF"
+  g <- g + ggplot2::labs(
+    title = if (nzchar(title)) title else "Shaded area",
+    subtitle = lab, x = "x", y = y_lab
+  )
+  
+  attr(g, "shade_info") <- list(
+    side = side, a = a, b = b, area = area,
+    lower = lower, upper = upper,
+    discrete = is_discrete, dfun = dfun_name,
+    approx = approx, continuity = continuity
+  )
+  g
+}
+
+
+
+# Tailed Test for the Helper: CLT
+# Confidence Interval use the tail-end of the given or wanted alpha. 
+
+# With quantile, 'a' is left-tailed and 'b' to signify right-tailed. 
+
+# Confidence Interval:
+# "left", "right", "two_tailed", "central"
+
+
+# For Two-Tailed Test:
+shade_area(
+           "two_tailed",
+           prob = 0.03, #alpha
+           dfun = dnorm, pfun = pnorm,
+           args = list(mean = 0.68 * 600, sd = 0.019043809 * 600), #Using CLT sd/sqrt(n)
+           title = "Normal PDF with 97% Confidence Level"
+           )
+
+#or 
+
+# 95% confidence interval for the mean (uses SE)
+se <- (0.213 * 3300.19) / sqrt(7)  # sd/sqrt(n)
+shade_area(
+           "two_tailed", prob = 0.05,
+           dfun = dnorm, pfun = pnorm,
+           args = list(mean = 0.228 * 3300.19, sd = se), 
+           title = "Sampling distribution of x bar (95% CL)"
+           )
+
+# CLT (Uniform): sampling distribution of Xbar from Unif(24,26), n = 100
+shade_area(
+           "left",
+           a = 25,
+           dfun = dnorm, pfun = pnorm,
+           args = list(mean = 25, sd = (26 - 24)/sqrt(12*100)),
+           title = "Pr(x bar ≤ 24.9) for n=100, X~Unif(24,26) (CLT)"
+           )
+
+
+
+
