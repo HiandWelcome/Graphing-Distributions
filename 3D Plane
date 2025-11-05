@@ -1,0 +1,444 @@
+#chatGPT generated codes and visuals. 
+#Very helpful in learning about distributions. 
+
+# --- Dependencies ---
+suppressPackageStartupMessages({
+  library(plotly)
+  library(VGAM)
+  library(actuar)
+})
+
+# Accessor (unchanged)
+get_shade_info <- function(obj) attr(obj, "shade_info")
+
+# --- New 3D helper with probability text + optional 2D sidecar ---
+shade_area_3d <- function(
+    side = c("between", "left", "right", "two_tailed", "central"),
+    a = NA, b = NA,
+    prob = 0.05,
+    central_prob = 0.95,
+    dfun, pfun, args = list(),
+    xrange = NULL, title = "",
+    approx = c("native","normal"),
+    continuity = FALSE,
+    # Display toggles
+    show_pdf = TRUE,
+    show_cdf = TRUE,
+    # Visual controls
+    front_offset = 0.15,   # front plane distance (negative y)
+    pdf_offset   = 0.00,   # nudge PDF further forward
+    cdf_offset   = 0.08,   # nudge CDF further forward
+    cdf_color    = "black",
+    pdf_line_width = 6,
+    cdf_line_width = 6,
+    # CDF scaling: "pdf" scales to max(PDF), "unit" shows 0..1
+    cdf_scale = c("pdf","unit"),
+    # Draw ordering
+    cdf_on_top = TRUE,
+    # Probability label + optional 2D companion
+    show_prob = TRUE,
+    prob_digits = 4,
+    prob_where = c("annotation","title"),
+    prob_sep = " — ",          # separator between title and probability when prob_where="title"
+    make_2d = FALSE,
+    # Cursor controls
+    cursor_x = NA_real_,           # if finite, draws a cursor at x
+    show_cursor = TRUE,
+    cursor_color = "dodgerblue",
+    cursor_width = 5,
+    cursor_dash = "dot",
+    cursor_label = TRUE,
+    cursor_label_fmt = "x=%#.5g\nPDF=%#.5g\nCDF=%#.5g",
+    cursor_label_nudge = 0.04      # fraction of PDF peak to lift the label in z
+) {
+  side   <- match.arg(side)
+  approx <- match.arg(approx)
+  cdf_scale <- match.arg(cdf_scale)
+  prob_where <- match.arg(prob_where)
+  
+  is_specified <- function(z) isTRUE(is.finite(z))
+  nm_strip     <- function(z) sub(".*::", "", z)
+  
+  dfun_name     <- nm_strip(deparse(substitute(dfun)))
+  pfun_name     <- nm_strip(deparse(substitute(pfun)))
+  expected_pfun <- sub("^d", "p", dfun_name)
+  if (!identical(pfun_name, expected_pfun)) {
+    warning(sprintf("dfun/pfun may be from different families: dfun='%s', pfun='%s' (expected '%s').",
+                    dfun_name, pfun_name, expected_pfun))
+  }
+  
+  is_discrete0 <- grepl("^(dbinom|dpois|dgeom|dhyper|dnbinom)\\b", dfun_name, ignore.case = TRUE)
+  dens <- function(x) do.call(dfun, c(list(x), args))
+  cdf  <- function(x) do.call(pfun, c(list(x), args))
+  
+  # q* resolver preferring dfun's namespace
+  get_qfun <- function(dfun_obj, dfun_name) {
+    qname <- sub("^d", "q", nm_strip(dfun_name))
+    env <- environment(dfun_obj)
+    ns_name <- tryCatch(getNamespaceName(env), error = function(e) NULL)
+    if (is.character(ns_name) && nzchar(ns_name)) {
+      if (qname %in% getNamespaceExports(ns_name)) return(getFromNamespace(qname, ns_name))
+      if (exists(qname, envir = asNamespace(ns_name), mode = "function", inherits = FALSE)) {
+        return(getFromNamespace(qname, ns_name))
+      }
+    }
+    if (exists(qname, mode = "function")) return(get(qname))
+    NULL
+  }
+  qfun0 <- get_qfun(dfun, dfun_name)
+  qfun  <- if (!is.null(qfun0)) function(p) do.call(qfun0, c(list(p), args)) else NULL
+  
+  # Optional: normal approx for discrete families
+  switched_to_normal <- FALSE
+  if (approx == "normal" && is_discrete0) {
+    mu <- sd <- NA_real_
+    if (grepl("^dbinom\\b", dfun_name, TRUE) && !is.null(args$size) && !is.null(args$prob)) {
+      n <- args$size; p <- args$prob; mu <- n*p; sd <- sqrt(n*p*(1-p))
+    } else if (grepl("^dpois\\b", dfun_name, TRUE) && !is.null(args$lambda)) {
+      mu <- args$lambda; sd <- sqrt(args$lambda)
+    } else if (grepl("^dgeom\\b", dfun_name, TRUE) && !is.null(args$prob)) {
+      p <- args$prob; mu <- (1-p)/p; sd <- sqrt(1-p)/p
+    } else if (grepl("^dnbinom\\b", dfun_name, TRUE) && !is.null(args$size) && (!is.null(args$prob) || !is.null(args$mu))) {
+      r <- args$size
+      if (!is.null(args$prob)) { p <- args$prob; mu <- r*(1-p)/p; sd <- sqrt(r*(1-p))/p
+      } else { mu <- args$mu; sd <- sqrt(mu + (mu^2)/r) }
+    } else if (grepl("^dhyper\\b", dfun_name, TRUE) && all(c("m","n","k") %in% names(args))) {
+      m <- args$m; n <- args$n; k <- args$k; N <- m+n
+      mu <- k*(m/N); sd <- sqrt(k*(m/N)*(1-m/N)*((N-k)/(N-1)))
+    }
+    if (is.finite(mu) && is.finite(sd) && sd > 0) {
+      if (continuity) {
+        if (side %in% c("left","right","between")) {
+          if (side=="left"     && is_specified(a)) a <- a + 0.5
+          if (side=="right"    && is_specified(b)) b <- b - 0.5
+          if (side=="between") {
+            if (is_specified(a)) a <- a - 0.5
+            if (is_specified(b)) b <- b + 0.5
+          }
+        }
+      }
+      dfun <- stats::dnorm; pfun <- stats::pnorm
+      args <- list(mean = mu, sd = sd)
+      qfun <- function(p) stats::qnorm(p, mean = mu, sd = sd)
+      switched_to_normal <- TRUE
+    }
+  }
+  is_discrete <- if (switched_to_normal) FALSE else is_discrete0
+  
+  # xrange
+  if (is.null(xrange)) {
+    if (!is.null(qfun)) {
+      xrange <- c(qfun(0.001), qfun(0.999))
+      if (!all(is.finite(xrange))) xrange <- c(-100, 100)
+    } else {
+      pos_support <- grepl("(gamma|chisq|pareto|lomax|exp)\\b", dfun_name, TRUE)
+      xrange <- if (pos_support) c(0, 100) else c(-100, 100)
+    }
+  }
+  xrange <- sort(xrange)
+  
+  # grid
+  if (is_discrete) {
+    x <- seq(ceiling(xrange[1]), floor(xrange[2]), by = 1L)
+    y <- dens(x)
+  } else {
+    x <- seq(xrange[1], xrange[2], length.out = 2000)
+    y <- dens(x)
+  }
+  
+  # shading + labels
+  lab <- ""
+  area <- NA_real_
+  lower <- upper <- NA_real_
+  mask <- rep(FALSE, length(x))
+  get_area_cdf <- function(a, b) if (is_discrete) sum(y[x >= ceiling(a) & x <= floor(b)]) else cdf(b) - cdf(a)
+  cdf_vals <- list(a = NA_real_, b = NA_real_, lower = NA_real_, upper = NA_real_)
+  
+  if (side == "between") {
+    stopifnot(is_specified(a), is_specified(b), a < b)
+    mask <- if (is_discrete) x >= ceiling(a) & x <= floor(b) else x >= a & x <= b
+    area <- get_area_cdf(a, b)
+    cdf_vals$a <- cdf(a); cdf_vals$b <- cdf(b)
+    lab  <- sprintf("P(%g \u2264 X \u2264 %g) = %.4f", a, b, area)
+  } else if (side == "left") {
+    if (!is_specified(a)) { stopifnot(!is.null(qfun), prob>0 && prob<1); a <- qfun(prob) }
+    mask <- if (is_discrete) x <= floor(a) else x <= a
+    area <- if (is_discrete) sum(y[mask]) else cdf(a)
+    cdf_vals$a <- cdf(a)
+    lab  <- sprintf("P(X \u2264 %g) = %.4f", a, area)
+  } else if (side == "right") {
+    if (!is_specified(b)) { stopifnot(!is.null(qfun), prob>0 && prob<1); b <- qfun(1 - prob) }
+    mask <- if (is_discrete) x >= ceiling(b) else x >= b
+    area <- if (is_discrete) sum(y[mask]) else 1 - cdf(b)
+    cdf_vals$b <- cdf(b)
+    lab  <- sprintf("P(X \u2265 %g) = %.4f", b, area)
+  } else if (side == "two_tailed") {
+    stopifnot(!is.null(qfun), prob>0 && prob<1)
+    lower <- qfun(prob/2); upper <- qfun(1 - prob/2)
+    mask  <- (x <= lower) | (x >= upper)
+    area  <- if (is_discrete) sum(y[x <= floor(lower)]) + sum(y[x >= ceiling(upper)]) else prob
+    cdf_vals$lower <- cdf(lower); cdf_vals$upper <- cdf(upper)
+    lab   <- sprintf("Two-tailed \u03B1 = %.3f (cutoffs: [%.4g, %.4g])", prob, lower, upper)
+  } else if (side == "central") {
+    stopifnot(!is.null(qfun), central_prob>0 && central_prob<1)
+    alpha <- 1 - central_prob
+    lower <- qfun(alpha/2); upper <- qfun(1 - alpha/2)
+    mask  <- if (is_discrete) x >= ceiling(lower) & x <= floor(upper) else x >= lower & x <= upper
+    area  <- central_prob
+    cdf_vals$lower <- cdf(lower); cdf_vals$upper <- cdf(upper)
+    lab   <- sprintf("Central mass %.3f (cutoffs: [%.4g, %.4g])", central_prob, lower, upper)
+  }
+  
+  # 3D build
+  ygrid <- seq(0, 1, length.out = 5)
+  Z     <- matrix(rep(y, each = length(ygrid)), nrow = length(ygrid), byrow = TRUE)
+  Xv    <- x
+  Yv    <- ygrid
+  cmat  <- matrix(0, nrow = length(ygrid), ncol = length(x))
+  cmat[, mask] <- 1
+  
+  # FRONT PLANE (negative y => in front)
+  y_front <- min(Yv) - front_offset
+  y_pdf   <- y_front - pdf_offset
+  y_cdf   <- y_front - cdf_offset
+  
+  p <- plotly::plot_ly(showscale = TRUE) |>
+    plotly::add_surface(
+      x = ~Xv, y = ~Yv, z = ~Z,
+      surfacecolor = ~cmat,
+      colorscale = list(c(0, "lightgray"), c(1, "tomato")),
+      cauto = FALSE, cmin = 0, cmax = 1,
+      showscale = FALSE, opacity = 0.9,
+      name = "Surface", legendgroup = "Surface", showlegend = TRUE
+    ) |>
+    # Baseline first so ridgelines always draw on top
+    plotly::add_trace(
+      x = ~Xv, y = y_front, z = 0,
+      type = "scatter3d", mode = "lines",
+      line = list(width = 2),
+      name = "Baseline", legendgroup = "Other", showlegend = TRUE
+    )
+  
+  # cutoffs — extended to peak and along y-axis
+  add_cut <- function(px, x0, nm) {
+    z_peak <- if (all(!is.finite(y))) 1 else max(y, na.rm = TRUE)
+    y_min_local <- min(c(y_front, Yv), na.rm = TRUE)
+    y_max_local <- max(Yv, na.rm = TRUE)
+    px <- px |>
+      plotly::add_trace(
+        x = c(x0, x0), y = c(y_front, y_front), z = c(0, z_peak),
+        type = "scatter3d", mode = "lines",
+        line = list(dash = "dash"),
+        name = nm, legendgroup = "Cutoffs", showlegend = TRUE
+      ) |>
+      plotly::add_trace(
+        x = c(x0, x0), y = c(y_min_local, y_max_local), z = c(z_peak, z_peak),
+        type = "scatter3d", mode = "lines",
+        line = list(dash = "dash"),
+        name = paste0(nm, " (y-extent)"), legendgroup = "Cutoffs", showlegend = FALSE
+      )
+    px
+  }
+  if (side %in% c("between","left") && is_specified(a)) p <- add_cut(p, a, "cutoff a")
+  if (side %in% c("between","right") && is_specified(b)) p <- add_cut(p, b, "cutoff b")
+  if (side %in% c("two_tailed","central")) {
+    if (is.finite(lower)) p <- add_cut(p, lower, "lower")
+    if (is.finite(upper)) p <- add_cut(p, upper, "upper")
+  }
+  
+  # CDF ridge (scaled)
+  cdf_vec_raw <- tryCatch(cdf(Xv), error = function(e) rep(NA_real_, length(Xv)))
+  cdf_vec <- pmin(pmax(cdf_vec_raw, 0), 1)
+  z_scale <- if (all(!is.finite(y))) 1 else max(y, na.rm = TRUE)
+  if (cdf_scale == "pdf") {
+    z_cdf   <- cdf_vec * z_scale
+    cdf_name <- "CDF (scaled to PDF peak)"
+  } else {
+    z_cdf   <- cdf_vec
+    cdf_name <- "CDF (0–1)"
+  }
+  
+  add_pdf <- function(p) {
+    p |>
+      plotly::add_trace(
+        x = ~Xv, y = y_pdf, z = ~y,
+        type = "scatter3d", mode = "lines",
+        line = list(width = pdf_line_width),
+        hovertemplate = "x=%{x}<br>z=%{z}<extra></extra>",
+        name = if (is_discrete) "PMF" else "PDF",
+        legendgroup = "PDF", showlegend = TRUE
+      )
+  }
+  add_cdf <- function(p) {
+    p |>
+      plotly::add_trace(
+        x = ~Xv, y = y_cdf, z = ~z_cdf,
+        type = "scatter3d", mode = "lines",
+        line = list(color = cdf_color, width = cdf_line_width),
+        hovertemplate = "x=%{x}<br>z=%{z}<extra></extra>",
+        name = cdf_name, legendgroup = "CDF", showlegend = TRUE
+      )
+  }
+  
+  # Draw order: ensure ridgelines render on top
+  if (cdf_on_top) { p <- add_pdf(p); p <- add_cdf(p) } else { p <- add_cdf(p); p <- add_pdf(p) }
+  
+  # Probability label text
+  prob_txt <- NULL
+  if (isTRUE(show_prob)) {
+    fmt <- function(x) formatC(x, digits = prob_digits, format = "f")
+    prob_txt <- switch(side,
+                       left  = if (is.finite(a)) paste0("P(X \u2264 ", signif(a,5), ") = ", fmt(area)) else paste0("Left tail = ", fmt(area)),
+                       right = if (is.finite(b)) paste0("P(X \u2265 ", signif(b,5), ") = ", fmt(area)) else paste0("Right tail = ", fmt(area)),
+                       between = paste0("P(", signif(a,5), " \u2264 X \u2264 ", signif(b,5), ") = ", fmt(area)),
+                       two_tailed = paste0("\u03B1 = ", fmt(area), " (two-tailed)"),
+                       central = paste0("Central mass = ", fmt(area))
+    )
+    if (identical(prob_where, "title")) {
+      title <- paste0(if (nzchar(title)) paste0(title, prob_sep) else "", prob_txt)
+    }
+  }
+  
+  # compute front-most y for proper axis range
+  y_min <- suppressWarnings(min(c(y_front, y_pdf, y_cdf), na.rm = TRUE))
+  
+  # Build annotations list safely
+  ann <- list(list(xref="paper", yref="paper", x=0, y=1.08, showarrow=FALSE, text = lab))
+  if (!is.null(prob_txt) && identical(prob_where, "annotation")) {
+    ann <- c(ann, list(list(xref="paper", yref="paper", x=1, y=1.08, xanchor="right", showarrow=FALSE, text = prob_txt)))
+  }
+  
+  p <- p |>
+    plotly::layout(
+      title = list(text = if (nzchar(title)) title else "Shaded area (3D)"),
+      showlegend = TRUE,
+      scene = list(
+        xaxis = list(title = "x"),
+        yaxis = list(title = "extrusion (y)", range = c(y_min, max(Yv))),
+        zaxis = list(title = if (isTRUE(show_cdf) && cdf_scale == "unit") "Height / CDF" else if (is_discrete) "PMF" else "PDF"),
+        camera = list(eye = list(x = 1.6, y = -1.6, z = 1.2))
+      ),
+      annotations = ann
+    )
+  
+  # ---- Cursor (optional) ----
+  if (isTRUE(show_cursor) && isTRUE(is.finite(cursor_x))) {
+    x_cur <- if (is_discrete) round(cursor_x) else cursor_x
+    z_pdf_at <- tryCatch(dens(x_cur), error = function(e) NA_real_)
+    cdf_at   <- pmin(pmax(tryCatch(cdf(x_cur), error = function(e) NA_real_), 0), 1)
+    z_peak   <- if (all(!is.finite(y))) 1 else max(y, na.rm = TRUE)
+    z_lift   <- z_peak * cursor_label_nudge
+    z_to     <- if (is.finite(z_pdf_at)) z_pdf_at else 0
+    
+    p <- p |>
+      plotly::add_trace(
+        x = c(x_cur, x_cur), y = c(y_front, y_front), z = c(0, z_to),
+        type = "scatter3d", mode = "lines",
+        line = list(color = cursor_color, width = cursor_width, dash = cursor_dash),
+        name = "Cursor", legendgroup = "Cursor", showlegend = TRUE,
+        hovertemplate = "x=%{x}<br>z=%{z}<extra></extra>"
+      )
+    
+    if (isTRUE(cursor_label)) {
+      z_cdf_at <- if (isTRUE(show_cdf)) { if (cdf_scale == "pdf") cdf_at * z_peak else cdf_at } else NA_real_
+      z_base <- max(c(0, z_to, z_cdf_at), na.rm = TRUE)
+      z_lab  <- z_base + z_lift
+      label_txt <- sprintf(cursor_label_fmt, x_cur, z_to, cdf_at)
+      
+      p <- p |>
+        plotly::add_trace(
+          x = x_cur, y = y_front, z = z_lab,
+          type = "scatter3d", mode = "text+markers",
+          marker = list(size = 2, color = cursor_color),
+          text = label_txt,
+          textfont = list(color = cursor_color),
+          name = "Cursor label", legendgroup = "Cursor", showlegend = FALSE
+        )
+    }
+  }
+  
+  info <- list(
+    side = side, area = area,
+    a = if (is_specified(a)) a else NA_real_,
+    b = if (is_specified(b)) b else NA_real_,
+    lower = lower, upper = upper,
+    cdf = cdf_vals,
+    discrete = is_discrete, dfun = dfun_name,
+    approx = approx, continuity = continuity
+  )
+  attr(p, "shade_info") <- info
+  
+  if (isTRUE(make_2d)) {
+    suppressPackageStartupMessages(library(ggplot2))
+    df2d <- data.frame(x = Xv, y = y)
+    if (is_discrete) {
+      shade_df <- if (any(mask)) subset(df2d, x >= min(Xv[mask]) & x <= max(Xv[mask])) else NULL
+      g <- ggplot2::ggplot(df2d, ggplot2::aes(x, y)) +
+        ggplot2::geom_col(width = 0.9) +
+        { if (!is.null(shade_df)) ggplot2::geom_col(data = shade_df, ggplot2::aes(x, y), alpha = 0.3) else NULL } +
+        ggplot2::labs(
+          title = if (nzchar(title)) { if (!is.null(prob_txt) && !identical(prob_where, "title")) paste0(title, prob_sep, prob_txt) else title } else "Shaded area (2D)",
+          x = "x", y = "PMF"
+        )
+    } else {
+      shade_df <- if (any(mask)) subset(df2d, x >= min(Xv[mask], na.rm=TRUE) & x <= max(Xv[mask], na.rm=TRUE)) else NULL
+      g <- ggplot2::ggplot(df2d, ggplot2::aes(x, y)) +
+        ggplot2::geom_line() +
+        { if (!is.null(shade_df)) ggplot2::geom_ribbon(data = shade_df, ggplot2::aes(ymin = 0, ymax = y), alpha = 0.3) else NULL } +
+        ggplot2::labs(
+          title = if (nzchar(title)) { if (!is.null(prob_txt) && !identical(prob_where, "title")) paste0(title, prob_sep, prob_txt) else title } else "Shaded area (2D)",
+          x = "x", y = "PDF"
+        )
+    }
+    return(list(p3d = p, p2d = g))
+  }
+  
+  p
+}
+
+
+
+## ------------------------------
+## Tailed Test for the Helper: CLT
+## ------------------------------
+
+# Two-Tailed Test (α = 0.03 ⇒ 97% CL)
+shade_area_3d(
+  "two_tailed",
+  prob = 0.03, # alpha
+  dfun = dnorm, pfun = pnorm,
+  args = list(mean = 0.68 * 600, sd = 0.019043809 * 600),
+  title = "Normal PDF with 97% Confidence Level",
+  show_prob = TRUE, prob_where = "title", prob_sep = " ", prob_digits = 4
+)
+
+# 95% confidence interval for the mean (uses SE)
+se <- (0.213 * 3300.19) / sqrt(7)
+shade_area_3d(
+  "two_tailed", prob = 0.05,
+  dfun = dnorm, pfun = pnorm,
+  args = list(mean = 0.228 * 3300.19, sd = se), 
+  title = "Sampling distribution of x̄ (95% CL)",
+  show_prob = TRUE, prob_where = "title", prob_sep = " ", prob_digits = 4
+)
+
+# CLT (Uniform): sampling distribution of X̄ from Unif(24,26), n = 100
+shade_area_3d(
+  "left",
+  a = 25,
+  dfun = dnorm, pfun = pnorm,
+  args = list(mean = 25, sd = (26 - 24)/sqrt(12*100)),
+  title = "Pr(x̄ ≤ 25) for n=100, X~Unif(24,26) (CLT)",
+  show_prob = TRUE, prob_where = "title", prob_sep = " ", prob_digits = 4,
+  cursor_x = 25
+)
+
+# CLT (Uniform): 75th percentile (left-tail prob = 0.75)
+shade_area_3d(
+  "left",
+  prob = 0.75,
+  dfun = dnorm, pfun = pnorm,
+  args = list(mean = 400, sd = 1.1547 * sqrt(50)),
+  title = "75th Percentile for n=400, X~Unif(4,6) (CLT)",
+  show_prob = TRUE, prob_where = "title", prob_sep = " ", prob_digits = 4
+)
